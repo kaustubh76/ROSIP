@@ -7,10 +7,10 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import "../interfaces/IDynamicFeeHook.sol";
 import "../interfaces/IRiskScoring.sol";

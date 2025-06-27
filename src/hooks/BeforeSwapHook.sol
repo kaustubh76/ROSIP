@@ -8,8 +8,8 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -380,7 +380,7 @@ contract BeforeSwapHook is IBeforeSwapHook, BaseHook, Ownable {
             int256 positiveAmount = -swapParams.amountSpecified;
             amountIn = uint256(positiveAmount);
         } else {
-            amountIn = uint256(uint256(swapParams.amountSpecified));
+            amountIn = uint256(swapParams.amountSpecified);
         }
         
         uint24 adjustedFee = calculateAdjustedFee(
