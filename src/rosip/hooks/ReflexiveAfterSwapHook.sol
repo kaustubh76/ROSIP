@@ -3,18 +3,21 @@ pragma solidity ^0.8.26;
 
 import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {ReflexiveOracleState} from "../core/ReflexiveOracleState.sol";
+import {ROSIPOrchestrator} from "../core/ROSIPOrchestrator.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 /**
- * @title ReflexiveAfterSwapHook
+ * @title ReflexiveAfterSwapHook  
  * @notice Revolutionary hook that transforms returnDelta into insurance oracle signals
- * @dev This is the core innovation of ROSIP - using swap accounting data as reflexive oracle input
+ * @dev THE CORE INNOVATION: Using swap accounting data as reflexive oracle input with UHI integration
+ * @dev Enhanced with existing UHI infrastructure for comprehensive risk assessment
  */
 contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
     using PoolIdLibrary for PoolKey;
@@ -23,6 +26,9 @@ contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
     
     /// @notice The reflexive oracle state contract
     ReflexiveOracleState public immutable reflexiveOracle;
+    
+    /// @notice The ROSIP orchestrator for enhanced UHI integration
+    ROSIPOrchestrator public immutable rosipOrchestrator;
     
     /// @notice Expected delta calculation parameters
     struct DeltaExpectation {
@@ -74,11 +80,12 @@ contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
     constructor(
         IPoolManager _poolManager,
         ReflexiveOracleState _reflexiveOracle,
-        address _admin
+        address _rosipOrchestrator
     ) BaseHook(_poolManager) {
         reflexiveOracle = _reflexiveOracle;
-        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
-        _grantRole(ORCHESTRATOR_ROLE, _admin);
+        rosipOrchestrator = ROSIPOrchestrator(_rosipOrchestrator);
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ORCHESTRATOR_ROLE, msg.sender);
     }
     
     /// @notice Returns the hook's permissions
@@ -126,7 +133,7 @@ contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
             lastStatUpdate: block.timestamp
         });
         
-        return BaseHook.afterInitialize.selector;
+        return IHooks.afterInitialize.selector;
     }
     
     /**
@@ -177,6 +184,16 @@ contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
                 _calculateDeviationPercent(actualDelta, expectedDelta),
                 anomalyLevel
             );
+        }
+        
+        // ENHANCED UHI INTEGRATION: Report anomalies to ROSIP Orchestrator
+        if (anomalyLevel >= ReflexiveOracleState.AnomalyLevel.SIGNIFICANT_ANOMALY) {
+            bytes memory anomalyData = abi.encode(
+                uint256(anomalyLevel),
+                _getAnomalyReason(anomalyLevel, actualDelta, expectedDelta)
+            );
+            
+            rosipOrchestrator.handleEnhancedCriticalAnomaly(key, anomalyData);
         }
         
         // Handle emergency situations
@@ -405,5 +422,24 @@ contract ReflexiveAfterSwapHook is BaseHook, AccessControl {
         returns (int256[20] memory deltas, uint256 currentIndex) 
     {
         return (historicalDeltas[poolId], historicalDeltaIndex[poolId]);
+    }
+    
+    /**
+     * @dev Get anomaly reason string for enhanced UHI integration
+     */
+    function _getAnomalyReason(
+        ReflexiveOracleState.AnomalyLevel level,
+        int256 actualDelta,
+        int256 expectedDelta
+    ) internal pure returns (string memory) {
+        if (level == ReflexiveOracleState.AnomalyLevel.CRITICAL_ANOMALY) {
+            return "CRITICAL_DELTA_ANOMALY";
+        } else if (level == ReflexiveOracleState.AnomalyLevel.SIGNIFICANT_ANOMALY) {
+            return "SIGNIFICANT_DELTA_DEVIATION";
+        } else if (level == ReflexiveOracleState.AnomalyLevel.MINOR_ANOMALY) {
+            return "MINOR_DELTA_VARIANCE";
+        } else {
+            return "NORMAL_DELTA_FLUCTUATION";
+        }
     }
 }

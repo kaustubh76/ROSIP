@@ -2,5 +2,46 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    "@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+    "@forge-std/=lib/forge-std/src/",
+    "solmate/=lib/v4-core/lib/solmate/src/"
+]
+solc = "0.8.26"
+optimizer = true
+optimizer_runs = 1000000
+via_ir = true
+evm_version = "cancun"
+verbosity = 3
+ffi = true
+
+[profile.optimized]
+via_ir = true
+optimizer = true
+optimizer_runs = 1000000
+
+[profile.test]
+src = "test"
+optimizer = true
+optimizer_runs = 1000000
+via_ir = true
+fuzz_runs = 1000
+verbosity = 3
+
+[rpc_endpoints]
+mainnet = "${ETH_RPC_URL}"
+sepolia = "${SEPOLIA_RPC_URL}"
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+[etherscan]
+mainnet = { key = "${ETHERSCAN_API_KEY}" }
+sepolia = { key = "${ETHERSCAN_API_KEY}" }
+base = { key = "${BASESCAN_API_KEY}" }
+base_sepolia = { key = "${BASESCAN_API_KEY}" }
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
