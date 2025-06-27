@@ -67,6 +67,40 @@ contract RiskScoring is IRiskScoring, Ownable {
     // List of whitelisted oracles/keepers that can update risk data
     mapping(address => bool) public whitelistedUpdaters;
     
+    // Contract active state
+    bool private _active;
+    
+    // User reputation scores (0-1000, higher is better)
+    mapping(address => uint256) public userReputation;
+    
+    // User risk profiles
+    struct UserRiskProfile {
+        uint256 totalVolume;
+        uint256 transactionCount;
+        uint256 lastActivityTime;
+        bool isActive;
+    }
+    
+    mapping(address => UserRiskProfile) public userRiskProfiles;
+    
+    // Token risk levels (manual overrides)
+    mapping(address => uint256) public tokenRiskLevels;
+    
+    // Pair risk multipliers (stored by hash of sorted pair)
+    mapping(bytes32 => uint256) public pairRiskMultipliers;
+    
+    // Risk parameters
+    struct RiskParameters {
+        uint256 amountThreshold;
+        uint256 volumeThreshold;
+        uint256 timeWindow;
+    }
+    
+    RiskParameters public riskParameters;
+    
+    // Blacklisted addresses
+    mapping(address => bool) public blacklist;
+    
     // Events
     event RiskProfileUpdated(address indexed token, uint256 compositeScore);
     event TokenMetadataUpdated(address indexed token, uint8 tokenType, uint8 auditCount);
@@ -76,7 +110,373 @@ contract RiskScoring is IRiskScoring, Ownable {
      * @notice Constructor
      * @param _owner Initial owner of the contract
      */
-    constructor(address _owner) Ownable(_owner) {}
+    constructor(address _owner) Ownable(_owner) {
+        _active = true; // Start active by default
+        
+        // Initialize default risk parameters
+        riskParameters = RiskParameters({
+            amountThreshold: 10000 * 1e18,    // 10k default
+            volumeThreshold: 500000 * 1e18,   // 500k default
+            timeWindow: 24 * 3600             // 24 hours default
+        });
+    }
+
+    /**
+     * @notice Check if the contract is active
+     * @return Whether the contract is active
+     */
+    function isActive() external view returns (bool) {
+        return _active;
+    }
+    
+    /**
+     * @notice Set the active state of the contract (admin only)
+     * @param active New active state
+     */
+    function setActive(bool active) external onlyOwner {
+        _active = active;
+    }
+
+    /**
+     * @notice Assess risk for a user and token pair
+     * @param user User address
+     * @param token0 First token address
+     * @param token1 Second token address  
+     * @param amount Transaction amount
+     * @return riskScore Overall risk score (0-1000)
+     */
+    function assessRisk(
+        address user,
+        address token0,
+        address token1,
+        uint256 amount
+    ) external view returns (uint256 riskScore) {
+        // Check if user is blacklisted
+        if (blacklist[user]) {
+            return MAX_RISK_SCORE; // Maximum risk for blacklisted users
+        }
+        
+        // Get individual token risk scores
+        uint256 token0Risk = this.getRiskScore(token0);
+        uint256 token1Risk = this.getRiskScore(token1);
+        
+        // Take the maximum risk of the two tokens
+        uint256 baseRisk = token0Risk > token1Risk ? token0Risk : token1Risk;
+        
+        // Apply pair-specific risk multiplier if set
+        bytes32 pairHash = keccak256(abi.encodePacked(token0, token1));
+        uint256 multiplier = pairRiskMultipliers[pairHash];
+        if (multiplier > 0) {
+            baseRisk = (baseRisk * multiplier) / 100;
+        }
+        
+        // Add amount-based risk premium for large transactions
+        uint256 amountRisk = 0;
+        if (amount > 100000 * 1e18) { // Large amounts increase risk
+            amountRisk = 50; // Add 50 risk points for very large amounts
+        } else if (amount > 10000 * 1e18) {
+            amountRisk = 25; // Add 25 risk points for large amounts
+        }
+        
+        // For users, use reputation to adjust risk (higher reputation = lower risk)
+        uint256 userRisk = 50; // Base risk for new users
+        uint256 reputation = userReputation[user];
+        if (reputation > 0) {
+            // Reduce risk based on reputation (reputation of 500 = 25 risk reduction)
+            uint256 riskReduction = reputation / 20; // reputation / 20 gives 0-50 reduction
+            if (riskReduction > userRisk) {
+                userRisk = 0;
+            } else {
+                userRisk -= riskReduction;
+            }
+        }
+        
+        // Combine all risk factors
+        riskScore = baseRisk + amountRisk + userRisk;
+        
+        // Cap at maximum risk score
+        if (riskScore > MAX_RISK_SCORE) {
+            riskScore = MAX_RISK_SCORE;
+        }
+        
+        return riskScore;
+    }
+
+    /**
+     * @notice Update user reputation score
+     * @param user User address
+     * @param amount Amount to change reputation by
+     * @param positive Whether this is a positive or negative update
+     */
+    function updateUserReputation(address user, uint256 amount, bool positive) external onlyOwner {
+        if (positive) {
+            userReputation[user] += amount;
+            if (userReputation[user] > 1000) {
+                userReputation[user] = 1000; // Cap at max reputation
+            }
+        } else {
+            if (userReputation[user] >= amount) {
+                userReputation[user] -= amount;
+            } else {
+                userReputation[user] = 0; // Floor at zero
+            }
+        }
+    }
+
+    /**
+     * @notice Set token risk level (manual override)
+     * @param token Token address
+     * @param riskLevel Risk level (0-1000)
+     */
+    function setTokenRiskLevel(address token, uint256 riskLevel) external onlyOwner {
+        require(riskLevel <= MAX_RISK_SCORE, "Risk level too high");
+        tokenRiskLevels[token] = riskLevel;
+    }
+
+    /**
+     * @notice Set pair risk multiplier
+     * @param token0 First token address
+     * @param token1 Second token address
+     * @param multiplier Risk multiplier (100 = 1.0x, 150 = 1.5x)
+     */
+    function setPairRiskMultiplier(address token0, address token1, uint256 multiplier) external onlyOwner {
+        bytes32 pairHash = keccak256(abi.encodePacked(token0, token1));
+        pairRiskMultipliers[pairHash] = multiplier;
+    }
+
+    /**
+     * @notice Update risk parameters
+     * @param amountThreshold New amount threshold
+     * @param volumeThreshold New volume threshold
+     * @param timeWindow New time window
+     */
+    function updateRiskParameters(
+        uint256 amountThreshold,
+        uint256 volumeThreshold,
+        uint256 timeWindow
+    ) external onlyOwner {
+        riskParameters = RiskParameters({
+            amountThreshold: amountThreshold,
+            volumeThreshold: volumeThreshold,
+            timeWindow: timeWindow
+        });
+    }
+
+    /**
+     * @notice Get current risk parameters
+     * @return amountThreshold Current amount threshold
+     * @return volumeThreshold Current volume threshold
+     * @return timeWindow Current time window
+     */
+    function getRiskParameters() external view returns (
+        uint256 amountThreshold,
+        uint256 volumeThreshold,
+        uint256 timeWindow
+    ) {
+        return (
+            riskParameters.amountThreshold,
+            riskParameters.volumeThreshold,
+            riskParameters.timeWindow
+        );
+    }
+
+    /**
+     * @notice Add address to blacklist
+     * @param user Address to blacklist
+     */
+    function addToBlacklist(address user) external onlyOwner {
+        blacklist[user] = true;
+    }
+
+    /**
+     * @notice Remove address from blacklist
+     * @param user Address to remove from blacklist
+     */
+    function removeFromBlacklist(address user) external onlyOwner {
+        blacklist[user] = false;
+    }
+
+    /**
+     * @notice Check if address is blacklisted
+     * @param user Address to check
+     * @return Whether address is blacklisted
+     */
+    function isBlacklisted(address user) external view returns (bool) {
+        return blacklist[user];
+    }
+
+    /**
+     * @notice Get user risk profile
+     * @param user User address
+     * @return totalVolume Total volume traded by user
+     * @return transactionCount Number of transactions by user
+     * @return reputation User reputation score
+     * @return lastActivityTime Last activity timestamp
+     * @return userIsActive Whether user is active
+     */
+    function getUserRiskProfile(address user) external view returns (
+        uint256 totalVolume,
+        uint256 transactionCount,
+        uint256 reputation,
+        uint256 lastActivityTime,
+        bool userIsActive
+    ) {
+        UserRiskProfile memory profile = userRiskProfiles[user];
+        uint256 userRep = userReputation[user];
+        
+        // Default reputation for new users
+        if (userRep == 0) {
+            userRep = 500; // Default mid-level reputation
+        }
+        
+        return (
+            profile.totalVolume,
+            profile.transactionCount,
+            userRep,
+            profile.lastActivityTime,
+            profile.isActive || userRep > 0 // Active if has reputation or explicit flag
+        );
+    }
+
+    /**
+     * @notice Calculate volume-based risk factor
+     * @param user User address
+     * @param volume Transaction volume
+     * @return riskFactor Risk factor based on volume
+     */
+    function calculateVolumeRisk(address user, uint256 volume) external view returns (uint256 riskFactor) {
+        UserRiskProfile memory profile = userRiskProfiles[user];
+        
+        // Base risk factor starts at 100 (1.0x)
+        riskFactor = 100;
+        
+        // Increase risk for large volumes relative to user's history
+        if (profile.totalVolume > 0) {
+            uint256 volumeRatio = (volume * 1000) / profile.totalVolume;
+            if (volumeRatio > 500) { // Volume > 50% of total history
+                riskFactor += 50; // 1.5x risk
+            } else if (volumeRatio > 200) { // Volume > 20% of total history
+                riskFactor += 25; // 1.25x risk
+            }
+        } else {
+            // New user with large first transaction
+            if (volume > riskParameters.amountThreshold) {
+                riskFactor += 100; // 2.0x risk for new users with large amounts
+            }
+        }
+        
+        return riskFactor;
+    }
+
+    /**
+     * @notice Calculate frequency-based risk factor
+     * @param user User address
+     * @return riskFactor Risk factor based on transaction frequency
+     */
+    function calculateFrequencyRisk(address user) external view returns (uint256 riskFactor) {
+        UserRiskProfile memory profile = userRiskProfiles[user];
+        
+        // Base risk factor
+        riskFactor = 100;
+        
+        // If user has transaction history
+        if (profile.transactionCount > 0 && profile.lastActivityTime > 0) {
+            uint256 timeSinceLastActivity = block.timestamp - profile.lastActivityTime;
+            
+            // Recent activity reduces risk
+            if (timeSinceLastActivity < 1 hours) {
+                riskFactor = 80; // 20% reduction for very recent activity
+            } else if (timeSinceLastActivity < 24 hours) {
+                riskFactor = 90; // 10% reduction for recent activity
+            } else if (timeSinceLastActivity > 30 days) {
+                riskFactor = 120; // 20% increase for long inactivity
+            }
+            
+            // High frequency trading patterns
+            if (profile.transactionCount > 100) {
+                riskFactor = (riskFactor * 90) / 100; // 10% reduction for experienced users
+            }
+        } else {
+            // New user - moderate increase
+            riskFactor = 110;
+        }
+        
+        return riskFactor;
+    }
+
+    /**
+     * @notice Calculate token pair risk factor
+     * @param token0 First token address
+     * @param token1 Second token address
+     * @return riskFactor Risk factor based on token pair
+     */
+    function calculateTokenRisk(address token0, address token1) external view returns (uint256 riskFactor) {
+        uint256 token0Risk = this.getRiskScore(token0);
+        uint256 token1Risk = this.getRiskScore(token1);
+        
+        // Take the maximum risk of the two tokens
+        uint256 maxRisk = token0Risk > token1Risk ? token0Risk : token1Risk;
+        
+        // Convert risk score (0-1000) to risk factor (100 = 1.0x)
+        // Risk score 0 = factor 100, risk score 1000 = factor 200
+        riskFactor = 100 + (maxRisk / 10);
+        
+        // Apply pair-specific multiplier if set
+        bytes32 pairHash = keccak256(abi.encodePacked(token0, token1));
+        uint256 multiplier = pairRiskMultipliers[pairHash];
+        if (multiplier > 0) {
+            riskFactor = (riskFactor * multiplier) / 100;
+        }
+        
+        return riskFactor;
+    }
+
+    /**
+     * @notice Check if a transaction is high risk
+     * @param user User address
+     * @param token0 First token address
+     * @param token1 Second token address
+     * @param amount Transaction amount
+     * @param urgency Transaction urgency level
+     * @return isHighRisk Whether the transaction is considered high risk
+     */
+    function isHighRiskTransaction(
+        address user,
+        address token0,
+        address token1,
+        uint256 amount,
+        uint256 urgency
+    ) external view returns (bool isHighRisk) {
+        // Check blacklist first
+        if (blacklist[user]) {
+            return true;
+        }
+        
+        // Get overall risk assessment
+        uint256 riskScore = this.assessRisk(user, token0, token1, amount);
+        
+        // High risk thresholds
+        if (riskScore > 700) { // Very high base risk
+            return true;
+        }
+        
+        if (riskScore > 500 && urgency > 80) { // High risk + high urgency
+            return true;
+        }
+        
+        if (amount > riskParameters.amountThreshold * 10) { // Very large amounts
+            return true;
+        }
+        
+        // Check token risk specifically
+        uint256 token0Risk = this.getRiskScore(token0);
+        uint256 token1Risk = this.getRiskScore(token1);
+        if (token0Risk > 800 || token1Risk > 800) { // Very risky tokens
+            return true;
+        }
+        
+        return false;
+    }
 
     /**
      * @notice Add a whitelisted updater
@@ -132,6 +532,11 @@ contract RiskScoring is IRiskScoring, Ownable {
      * @inheritdoc IRiskScoring
      */
     function getRiskScore(address token) external view override returns (uint256 score) {
+        // Check for manual override first
+        if (tokenRiskLevels[token] > 0) {
+            return tokenRiskLevels[token];
+        }
+        
         RiskProfile memory profile = riskProfiles[token];
         
         if (profile.lastUpdated == 0) {

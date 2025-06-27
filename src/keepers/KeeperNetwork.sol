@@ -67,6 +67,19 @@ contract KeeperNetwork is IKeeperNetwork, Ownable, ReentrancyGuard, VRFConsumerB
     // Mapping from VRF requestId to keeper selection request
     mapping(uint256 => bytes32) public vrfRequests;
     
+    // Job system (simplified for testing)
+    struct Job {
+        bytes32 id;
+        uint8 jobType;
+        bytes data;
+        bool isCompleted;
+        address executor;
+        uint256 timestamp;
+    }
+    
+    // Job registry
+    mapping(bytes32 => Job) public jobs;
+    
     // Events
     event KeeperRegistered(address indexed keeper, uint256 stake);
     event KeeperUnstaked(address indexed keeper, uint256 amount);
@@ -75,6 +88,8 @@ contract KeeperNetwork is IKeeperNetwork, Ownable, ReentrancyGuard, VRFConsumerB
     event OperationExecuted(bytes32 indexed operationId, address indexed keeper, bool success);
     event KeeperSlashed(address indexed keeper, uint256 amount, string reason);
     event KeeperRewarded(address indexed keeper, uint256 amount, bytes32 operationId);
+    event JobSubmitted(bytes32 indexed jobId, uint8 jobType);
+    event JobExecuted(bytes32 indexed jobId, address indexed keeper);
     
     /**
      * @notice Constructor
@@ -265,6 +280,73 @@ contract KeeperNetwork is IKeeperNetwork, Ownable, ReentrancyGuard, VRFConsumerB
     }
     
     /**
+     * @notice Test function to request operations with request ID returned for testing
+     * @param operationType The type of operation
+     * @param target The target contract address
+     * @param data The calldata to execute
+     * @param gasLimit Maximum gas to use
+     * @param reward Reward amount for executing operation
+     * @param deadline Timestamp after which the operation expires
+     * @return operationId The unique identifier for the operation
+     * @return requestId The VRF request ID
+     */
+    function requestOperationWithRequestId(
+        OperationType operationType,
+        address target,
+        bytes calldata data,
+        uint256 gasLimit,
+        uint256 reward,
+        uint256 deadline
+    ) external payable virtual nonReentrant returns (bytes32 operationId, uint256 requestId) {
+        require(target != address(0), "Invalid target");
+        require(deadline > block.timestamp, "Invalid deadline");
+        require(reward > 0, "Reward required");
+        
+        // Transfer reward from caller
+        stakingToken.safeTransferFrom(msg.sender, address(this), reward);
+        
+        // Generate operation ID
+        operationId = keccak256(abi.encodePacked(
+            msg.sender,
+            target,
+            data,
+            block.timestamp,
+            operationType
+        ));
+        
+        // Create operation
+        operations[operationId] = Operation({
+            id: operationId,
+            operationType: operationType,
+            target: target,
+            data: data,
+            gasLimit: gasLimit,
+            reward: reward,
+            deadline: deadline,
+            status: OperationStatus.PENDING,
+            assignedKeeper: address(0)
+        });
+        
+        // Add to operation queue
+        operationQueue[uint8(operationType)].push(operationId);
+        
+        // Request randomness for keeper assignment
+        requestId = vrfCoordinator.requestRandomWords(
+            keyHash,
+            subscriptionId,
+            3, // requestConfirmations
+            callbackGasLimit,
+            1  // numWords
+        );
+        
+        // Store requestId -> operationId mapping
+        vrfRequests[requestId] = operationId;
+        
+        emit OperationRequested(operationId, operationType, reward);
+        return (operationId, requestId);
+    }
+    
+    /**
      * @notice Callback function used by VRF Coordinator
      * @param requestId The ID of the request
      * @param randomWords The random result
@@ -399,6 +481,84 @@ contract KeeperNetwork is IKeeperNetwork, Ownable, ReentrancyGuard, VRFConsumerB
         _removeFromOperationQueue(uint8(operation.operationType), operationId);
     }
     
+    // =============== JOB SYSTEM FUNCTIONS (for integration tests) ===============
+    
+    /**
+     * @notice Submits a job to the keeper network
+     * @param jobId Unique identifier for the job
+     * @param jobType Type of job (e.g., 2 = rebalance)
+     * @param data Job data
+     */
+    function submitJob(bytes32 jobId, uint8 jobType, bytes calldata data) external {
+        require(jobs[jobId].id == bytes32(0), "Job already exists");
+        
+        jobs[jobId] = Job({
+            id: jobId,
+            jobType: jobType,
+            data: data,
+            isCompleted: false,
+            executor: address(0),
+            timestamp: block.timestamp
+        });
+        
+        emit JobSubmitted(jobId, jobType);
+    }
+    
+    /**
+     * @notice Executes a job
+     * @param jobId The job identifier
+     */
+    function executeJob(bytes32 jobId) external {
+        Job storage job = jobs[jobId];
+        require(job.id != bytes32(0), "Job does not exist");
+        require(!job.isCompleted, "Job already completed");
+        require(keepers[msg.sender].stake >= minimumStake, "Keeper not eligible");
+        
+        job.isCompleted = true;
+        job.executor = msg.sender;
+        
+        emit JobExecuted(jobId, msg.sender);
+    }
+    
+    /**
+     * @notice Gets job details
+     * @param jobId The job identifier
+     * @return id Job ID
+     * @return jobType Job type
+     * @return data Job data
+     * @return timestamp Job timestamp
+     * @return isCompleted Whether job is completed
+     * @return executor Job executor address
+     */
+    function getJob(bytes32 jobId) external view returns (
+        bytes32 id,
+        uint8 jobType,
+        bytes memory data,
+        uint256 timestamp,
+        bool isCompleted,
+        address executor
+    ) {
+        Job memory job = jobs[jobId];
+        return (job.id, job.jobType, job.data, job.timestamp, job.isCompleted, job.executor);
+    }
+    
+    /**
+     * @notice Rewards a keeper
+     * @param keeper The keeper address
+     * @param amount The reward amount
+     */
+    function rewardKeeper(address keeper, uint256 amount) external onlyOwner {
+        require(keepers[keeper].stake > 0, "Keeper not found");
+        require(amount > 0, "Invalid amount");
+        
+        // Transfer reward from contract to keeper
+        stakingToken.safeTransfer(keeper, amount);
+        
+        emit KeeperRewarded(keeper, amount, bytes32(0));
+    }
+    
+    // =============== INTERNAL FUNCTIONS ===============
+    
     /**
      * @notice Selects a keeper based on weighted random selection
      * @param randomValue The random value from VRF
@@ -496,6 +656,8 @@ contract KeeperNetwork is IKeeperNetwork, Ownable, ReentrancyGuard, VRFConsumerB
             }
         }
     }
+    
+    // =============== UTILITY FUNCTIONS ===============
     
     /**
      * @notice Emergency function to handle stuck operations

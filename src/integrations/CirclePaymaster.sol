@@ -52,8 +52,23 @@ contract CirclePaymaster is AccessControl, ReentrancyGuard {
     // Gas credits for users
     mapping(address => uint256) public gasCredits;
     
+    // User balances (deposited USDC)
+    mapping(address => uint256) public userBalances;
+    
+    // Total deposits across all users
+    uint256 public totalDeposits;
+    
+    // ETH to USDC conversion rate (USDC per ETH, scaled by 1e6)
+    uint256 public ethToUsdcRate;
+    
+    // Authorized callers for payForTransaction
+    mapping(address => bool) public authorizedCallers;
+    
     // Store admin address for owner() function
     address private _admin;
+    
+    // Contract active state
+    bool private _active;
     
     // Events
     event TransactionPreFunded(bytes32 indexed txId, address indexed user, uint256 fundingAmount);
@@ -61,6 +76,7 @@ contract CirclePaymaster is AccessControl, ReentrancyGuard {
     event FeesWithdrawn(address indexed receiver, uint256 amount);
     event FeeConfigUpdated(uint256 baseGasOverhead, uint256 feeMultiplier, uint256 minFee);
     event GasPaymentReceived(address indexed user, address indexed token, uint256 tokenAmount, uint256 gasAmount);
+    event ActiveStateChanged(bool active);
     
     /**
      * @notice Constructor
@@ -76,6 +92,9 @@ contract CirclePaymaster is AccessControl, ReentrancyGuard {
         usdcToken = IERC20(_usdcToken);
         gasPriceOracle = _gasPriceOracle;
         _admin = admin;
+        _active = true; // Start active by default
+        ethToUsdcRate = 3000 * 1e6; // Default: 3000 USDC per ETH
+        authorizedCallers[admin] = true; // Admin is authorized by default
         
         // Setup roles
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -91,6 +110,143 @@ contract CirclePaymaster is AccessControl, ReentrancyGuard {
         
         // Default exchange rate: 1 USDC (1e6) = 20,000 GWEI of gas
         tokenToGasExchangeRate = 20000 * 10**6;
+    }
+    
+    /**
+     * @notice Deposit USDC funds for paying gas
+     * @param amount Amount of USDC to deposit (6 decimals)
+     */
+    function depositFunds(uint256 amount) external whenActive {
+        require(amount > 0, "CirclePaymaster: amount must be greater than zero");
+        
+        // Transfer USDC from user
+        require(usdcToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        
+        userBalances[msg.sender] += amount;
+        totalDeposits += amount;
+    }
+    
+    /**
+     * @notice Withdraw USDC funds
+     * @param amount Amount of USDC to withdraw (6 decimals)
+     */
+    function withdrawFunds(uint256 amount) external {
+        require(amount > 0, "CirclePaymaster: amount must be greater than zero");
+        require(userBalances[msg.sender] >= amount, "CirclePaymaster: insufficient balance");
+        
+        userBalances[msg.sender] -= amount;
+        totalDeposits -= amount;
+        
+        require(usdcToken.transfer(msg.sender, amount), "Transfer failed");
+    }
+    
+    /**
+     * @notice Estimate gas cost in USDC
+     * @param gasUsed Gas amount used
+     * @param gasPrice Gas price in wei
+     * @return Cost in USDC (6 decimals)
+     */
+    function estimateGasCost(uint256 gasUsed, uint256 gasPrice) public view returns (uint256) {
+        // Calculate ETH cost: gasUsed * gasPrice (in wei)
+        uint256 ethCostWei = gasUsed * gasPrice;
+        
+        // Convert to USDC: (ethCostWei * ethToUsdcRate) / 1e18
+        uint256 usdcCost = (ethCostWei * ethToUsdcRate) / 1e18;
+        
+        // Apply fee multiplier
+        uint256 costWithFee = (usdcCost * feeConfig.feeMultiplier) / 10000;
+        
+        // Apply minimum fee
+        if (costWithFee < feeConfig.minFee) {
+            costWithFee = feeConfig.minFee;
+        }
+        
+        return costWithFee;
+    }
+    
+    /**
+     * @notice Pay for a transaction using user's deposited funds
+     * @param user User address
+     * @param gasUsed Gas used for the transaction
+     * @param gasPrice Gas price for the transaction
+     */
+    function payForTransaction(address user, uint256 gasUsed, uint256 gasPrice) external {
+        require(authorizedCallers[msg.sender] || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "CirclePaymaster: unauthorized");
+        
+        uint256 cost = estimateGasCost(gasUsed, gasPrice);
+        require(userBalances[user] >= cost, "CirclePaymaster: insufficient funds for gas");
+        
+        userBalances[user] -= cost;
+        totalDeposits -= cost;
+        totalFeesCollected += cost;
+    }
+    
+    /**
+     * @notice Get user's USDC balance
+     * @param user User address
+     * @return User's balance in USDC (6 decimals)
+     */
+    function getUserBalance(address user) external view returns (uint256) {
+        return userBalances[user];
+    }
+    
+    /**
+     * @notice Get total deposits across all users
+     * @return Total deposits in USDC (6 decimals)
+     */
+    function getTotalDeposits() external view returns (uint256) {
+        return totalDeposits;
+    }
+    
+    /**
+     * @notice Set gas price oracle address
+     * @param newOracle New oracle address
+     */
+    function setGasPriceOracle(address newOracle) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newOracle != address(0), "CirclePaymaster: invalid oracle address");
+        gasPriceOracle = newOracle;
+    }
+    
+    /**
+     * @notice Update ETH to USDC conversion rate
+     * @param newRate New rate (USDC per ETH, scaled by 1e6)
+     */
+    function updateConversionRate(uint256 newRate) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newRate > 0, "CirclePaymaster: invalid conversion rate");
+        ethToUsdcRate = newRate;
+    }
+    
+    /**
+     * @notice Add authorized caller for payForTransaction
+     * @param caller Address to authorize
+     */
+    function addAuthorizedCaller(address caller) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        authorizedCallers[caller] = true;
+    }
+    
+    /**
+     * @notice Remove authorized caller for payForTransaction
+     * @param caller Address to remove authorization
+     */
+    function removeAuthorizedCaller(address caller) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        authorizedCallers[caller] = false;
+    }
+    
+    /**
+     * @notice Check if address is authorized caller
+     * @param caller Address to check
+     * @return Whether address is authorized
+     */
+    function isAuthorizedCaller(address caller) external view returns (bool) {
+        return authorizedCallers[caller];
+    }
+    
+    /**
+     * @notice Emergency withdraw all contract funds (admin only)
+     */
+    function emergencyWithdraw() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 balance = usdcToken.balanceOf(address(this));
+        require(usdcToken.transfer(msg.sender, balance), "Transfer failed");
     }
     
     /**
@@ -418,5 +574,30 @@ contract CirclePaymaster is AccessControl, ReentrancyGuard {
             // Legacy gas price
             return tx.gasprice;
         }
+    }
+    
+    /**
+     * @notice Check if the contract is active
+     * @return Whether the contract is active
+     */
+    function isActive() public view returns (bool) {
+        return _active;
+    }
+    
+    /**
+     * @notice Set the active state of the contract (admin only)
+     * @param active New active state
+     */
+    function setActive(bool active) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _active = active;
+        emit ActiveStateChanged(active);
+    }
+    
+    /**
+     * @notice Modifier to ensure contract is active
+     */
+    modifier whenActive() {
+        require(_active, "CirclePaymaster: contract is not active");
+        _;
     }
 }
